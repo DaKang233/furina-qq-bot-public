@@ -10,11 +10,12 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client.js';
-import { renderMarkdownToPng } from './md-image.js';
+import { renderMarkdownToPng, normalizeTheme } from './md-image.js';
 import {
   resolveLegPaths, loadOrCreateSecret, signTicket, argsDigest,
   loadGrants, saveGrants, isPathInside, checkCommand
@@ -25,6 +26,7 @@ import { looksLikeUnfinished } from './v2-wait.js';
 import { safeFetchBuffer, validateFetchUrl, looksLikeImageBuffer, trustFetchHostFromUrl } from './safe-fetch.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { isConversationAllowed, selectConversationPreset } from './preset-routing.js';
+import { catalogFor, rememberSession, selectSession, validateSessionName, parseSessionCommand } from './session-catalog.js';
 import { createErrorRouter } from './error-routing.js';
 import { sealTurnPrompt } from './turn-auth.js';
 import {
@@ -1154,6 +1156,7 @@ async function main() {
       try {
         // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
         await sleep(randInt(800, 2000));
+        assertCurrentSessionOutput(key);
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -1278,6 +1281,7 @@ async function main() {
       try {
         // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
         await sleep(randInt(800, 2000));
+        assertCurrentSessionOutput(key);
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -1679,6 +1683,16 @@ async function main() {
     api.watchSession(sessionId);
   }
   const sessionPromises = new Map(); // key -> create promise（防并发重复创建）
+  const sessionSwitches = new Set(); // key：切换中拒绝旧工具与新消息提交。
+  const sessionVersions = new Map(); // 按 QQ 聊天失效旧的异步创建/投递，不影响其它群。
+  const sessionVersion = (key) => sessionVersions.get(key) || 0;
+  const toolRequestContext = new AsyncLocalStorage();
+  function assertCurrentSessionOutput(key) {
+    const auth = toolRequestContext.getStore()?.authorization;
+    if (sessionSwitches.has(key) || (auth?.key === key && auth.version !== sessionVersion(key))) {
+      throw new Error('DSH 会话已切换，旧工具请求已取消');
+    }
+  }
   const promptQueues = new Map(); // key -> { queue: [], running: false }：每个 QQ 会话串行投递 DSH prompt，保证 turn 顺序
 
   // 唤醒“防卡死”租约：正常应在 turn/end 时删除 pendingWakeKeys；若 DSH 接受了但一直没回合结束，
@@ -2209,15 +2223,19 @@ async function main() {
     // 控制台/管理端请求不带此头，仍走 consoleToken 管理通道。
     const agentTokenOk = (key, token) => {
       const canonical = canonicalV2Key(key);
+      if (sessionSwitches.has(canonical ?? key)) return false;
       const st = socialV2.conversations.get(canonical ?? key);
-      return !!st && !!st.agentToken && token === st.agentToken;
+      const ok = !!st && !!st.agentToken && token === st.agentToken;
+      const context = toolRequestContext.getStore();
+      if (ok && context) context.authorization ??= { key: canonical ?? key, version: sessionVersion(canonical ?? key) };
+      return ok;
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
     const v2ToolEnabled = (flag) => cfg.socialV2?.tools?.[flag] !== false;
 
     // LEG 审批的状态与函数在模块作用域（见文件顶部），这里只挂发送钩子。
-    const server = http.createServer(async (req, res) => {
+    const server = http.createServer((req, res) => toolRequestContext.run({}, async () => {
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
       const SECURITY_HEADERS = {
         'X-Frame-Options': 'DENY',
@@ -4137,7 +4155,8 @@ async function main() {
             rendered = await renderMarkdownToPng(markdown, {
               outPath,
               width: Number(body.width) || 1080,
-              height: body.height ? Number(body.height) : undefined
+              height: body.height ? Number(body.height) : undefined,
+              theme: normalizeTheme(body.theme)
             });
           } catch (error) {
             sendJson({ ok: false, error: `渲染失败：${error?.message ?? error}` }, 502);
@@ -6134,6 +6153,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '');
           if (!key || !state.sessions[key]) { sendJson({ ok: false, error: '会话不存在' }, 404); return; }
+          rememberActiveSession(key);
           sessionEpoch++;
           const oldSessionId = state.sessions[key];
           delete state.sessions[key];
@@ -6247,7 +6267,7 @@ async function main() {
         const status = Number(error?.statusCode) || 500;
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
-    });
+    }));
     server.listen(port, '127.0.0.1', () => {
       log(`本地控制台已启动：http://127.0.0.1:${port}`);
     });
@@ -6282,12 +6302,15 @@ async function main() {
   // 注意：这里曾加过「3 秒内容去重」，但被独立复核判定为会吞掉合法重复发言
   // （同一句被要求重发、分段里出现相同文本），且失败后重试也被挡。已移除。
   function sendToQQ(key, msg) {
+    const version = sessionVersion(key);
     const safeMsg = redactKnownTokensOnly(msg);
     const [kind, id] = key.split(':');
     const parts = splitForQQ(safeMsg);
     for (const part of parts) {
       sendChain = sendChain
         .then(async () => {
+          if (version !== sessionVersion(key)) return;
+          assertCurrentSessionOutput(key);
           if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           bridgeStatus.lastOutboundAt = Date.now(); // 只在真的发出去之后才记，失败不刷新
@@ -6501,6 +6524,7 @@ async function main() {
   }
 
   async function sendVoiceV2(key, file, replyToMessageId = null) {
+    assertCurrentSessionOutput(key);
     const [kind, id] = String(key).split(':');
     if (!modeAllowed(key, kind, Number(id), cfg, currentMode)) return { ok: false, error: '会话不在当前模式允许范围内' };
     const base = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -6783,6 +6807,7 @@ async function main() {
   }
 
   async function sendLocalImageV2(key, file) {
+    assertCurrentSessionOutput(key);
     const [kind, id] = String(key).split(':');
     if (!['private', 'group'].includes(kind) || !Number(id)) return { ok: false, error: '会话 key 无效' };
     const buf = fs.readFileSync(file);
@@ -7009,6 +7034,7 @@ async function main() {
   }
 
   async function sendFileV2(key, file, displayName) {
+    assertCurrentSessionOutput(key);
     const [kind, id] = String(key).split(':');
     if (!modeAllowed(key, kind, Number(id), cfg, currentMode)) return { ok: false, error: '会话不在当前模式允许范围内' };
     const maxMB = Number(songCfgV2().maxFileMB) || 60;
@@ -7125,6 +7151,7 @@ async function main() {
   }
 
   async function sendMusicCardV2(key, song) {
+    assertCurrentSessionOutput(key);
     const [kind, id] = String(key).split(':');
     if (!modeAllowed(key, kind, Number(id), cfg, currentMode)) return { ok: false, error: '会话不在当前模式允许范围内' };
     const base = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -7264,6 +7291,7 @@ async function main() {
   // 分条发送：与 sendToQQ 共用同一 sendChain，严格顺序；条间随机间隔，
   // 有概率使用长间隔（错落感）；最后一条后不再 sleep。
   function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
+    const version = sessionVersion(key);
     const [kind, id] = key.split(':');
     let min, max, longProb = 0, longMin = 0, longMax = 0;
     if (typeof socialCfgOrMin === 'object' && socialCfgOrMin !== null) {
@@ -7284,6 +7312,8 @@ async function main() {
       const isLast = i === messages.length - 1;
       sendChain = sendChain
         .then(async () => {
+          if (version !== sessionVersion(key)) return;
+          assertCurrentSessionOutput(key);
           if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           sent.push(msg);
@@ -7717,6 +7747,7 @@ async function main() {
   }
 
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
+    const version = sessionVersion(key);
     const [kind, id] = key.split(':');
     const sent = [];
     const failed = [];
@@ -7726,6 +7757,8 @@ async function main() {
       const useAt = i === 0 ? atUserId : null;
       sendChain = sendChain
         .then(async () => {
+          if (version !== sessionVersion(key)) throw new Error('DSH 会话已切换');
+          assertCurrentSessionOutput(key);
           await onebotSend(kind, id, msg, useReply, useAt);
           sent.push(msg);
         })
@@ -7821,8 +7854,186 @@ async function main() {
     }
   }
 
+  function rememberActiveSession(key) {
+    const sid = state.sessions[key];
+    // preset 缺失时按「显式覆盖 → 模式推导」回落，避免池记录缺 preset 而无法切回。
+    const presetForRecord = state.presets[key] ?? state.presetOverrides?.[key] ?? modePreset(key, currentMode, cfg) ?? null;
+    return sid ? rememberSession(state, key, { sessionId: sid, preset: presetForRecord }) : null;
+  }
+
+  // Only the active binding routes DSH output to QQ. Inactive sessions retain
+  // their DSH history, but lose their tool token and local execution grant.
+  async function switchDshSession(key, { target = null, name = null } = {}) {
+    if (sessionSwitches.has(key)) throw new Error('该聊天正在切换会话，请稍后再试');
+    if (!dshReady) throw new Error('DSH 尚未就绪，未切换会话');
+    if (name) {
+      validateSessionName(name);
+      if (catalogFor(state, key).some((s) => s.name === name)) throw new Error('会话名称已存在');
+    }
+    const oldSid = state.sessions[key];
+    const oldPreset = state.presets[key];
+    const oldOverride = state.presetOverrides?.[key];
+    if (target?.sessionId === oldSid) return rememberActiveSession(key);
+    if (oldSid && ((acceptedDeliveryQueues.get(oldSid)?.length || 0) + (submittingDeliveryQueues.get(oldSid)?.length || 0))) {
+      throw new Error('旧会话仍有等待 DSH 开始的投递，请等队列处理完再切换');
+    }
+    rememberActiveSession(key);
+    if (!target && catalogFor(state, key).length >= 100) throw new Error('当前聊天已保存 100 个会话');
+    sessionSwitches.add(key);
+    sessionVersions.set(key, sessionVersion(key) + 1);
+    try {
+      // Invalidate queued and in-flight local work before awaiting DSH cancel.
+      drainRetryQueue(key, 'session-switch');
+      drainPromptQueue(key, 'DSH 会话已切换');
+      sessionPromises.delete(key);
+      cancelSocialTimers(key);
+      clearSocialV2Timers(key);
+      legRevokeGrant(key);
+      const st = getSocialV2State(key);
+      // Keep retired tokens redacted from outputs, even after revocation.
+      st.agentToken = crypto.randomBytes(16).toString('hex');
+      KNOWN_AGENT_TOKENS.add(st.agentToken);
+      st.bootstrapSent = false;
+      st.pendingWakeReasons = [];
+      st.pendingWakeAuth = null;
+      st.unread = [];
+      st.sleepForever = false;
+      st.sleepUntil = 0;
+      st.waitBlockedAt = 0;
+      st.preSleepWaitSatisfiedAt = 0;
+      st.preSleepWaitObservedAt = 0;
+      st.preSleepWaitAccumMs = 0;
+      pendingWakeKeys.delete(key);
+      disarmPendingWakeLease(key);
+      wakeConfigMissCount.delete(key);
+      const interaction = pending.get(key);
+      if (interaction) {
+        clearTimeout(interaction.timer);
+        pending.delete(key);
+        await cancelPendingEntry(interaction);
+      }
+      if (oldSid) {
+        const cancelled = await api.sessions.cancel({ sessionId: oldSid });
+        // Cold/persisted sessions have no attached agent to cancel.
+        if (cancelled.result?.error?.code !== 'session/not-found') unwrap(cancelled, 'session.cancel');
+        reverse.delete(oldSid);
+        collectors.delete(oldSid);
+        collectorLastEventAt.delete(oldSid);
+        activeTurnIdsBySession.delete(oldSid);
+        v2TurnStartAt.delete(oldSid);
+        sendToolSucceededSessions.delete(oldSid);
+        pendingSendToolCalls.delete(oldSid);
+        toolCallNames.delete(oldSid);
+        snapshotRefreshAt.delete(oldSid);
+        disarmTurnLease(oldSid);
+      }
+      // cancel may deliver terminal events while awaited; clear any timers they
+      // scheduled before attaching the replacement session.
+      clearSocialV2Timers(key);
+      delete state.sessions[key];
+      delete state.presets[key];
+      let record;
+      if (target) {
+        // selectSession has checked ownership; re-check just before binding.
+        target = selectSession(state, key, target.sessionId);
+        unwrap(await api.workspace.unarchiveSession({ sessionId: target.sessionId }), 'workspace.unarchiveSession');
+        await api.watchSession(target.sessionId);
+        state.sessions[key] = target.sessionId;
+        state.presets[key] = target.preset;
+        state.presetOverrides[key] = target.preset;
+        reverse.set(target.sessionId, key);
+        record = target;
+      } else {
+        const sid = await ensureSession(key);
+        record = rememberSession(state, key, { sessionId: sid, preset: state.presets[key], name });
+      }
+      st.bootstrapSent = false;
+      saveState();
+      log(`[session] ${key} 已切换到 ${record.name} (${record.sessionId}, ${record.preset})`);
+      return record;
+    } catch (error) {
+      // A failed switch must not silently start forwarding to another session.
+      const failedSid = state.sessions[key];
+      if (failedSid && failedSid !== oldSid) reverse.delete(failedSid);
+      if (oldSid) {
+        state.sessions[key] = oldSid;
+        state.presets[key] = oldPreset;
+        reverse.set(oldSid, key);
+      } else {
+        delete state.sessions[key];
+        delete state.presets[key];
+      }
+      if (oldOverride === undefined) delete state.presetOverrides[key];
+      else state.presetOverrides[key] = oldOverride;
+      saveState();
+      throw error;
+    } finally {
+      saveSocialV2State();
+      sessionSwitches.delete(key);
+      scheduleProactiveCheckV2(key);
+      setupSleepTimerV2(key);
+    }
+  }
+
+  // 会话切换后的「上下文桥」：把切换前最近若干条 QQ 消息作为一次性上下文投给新会话。
+  // 新会话没有旧会话的 DSH 历史，人设/长期记忆会照常注入，但「刚聊到哪」只能靠这一步补。
+  async function injectSessionContextBridge(key, record) {
+    try {
+      const st = getSocialV2State(key);
+      const limit = Math.max(0, Math.min(60, Number(cfg.sessionSwitchContextBridge) || 20));
+      if (!limit) return;
+      const recent = Array.isArray(st.recentMessages) ? st.recentMessages.slice(-limit) : [];
+      if (!recent.length) return;
+      const lines = recent.map((m) => {
+        const who = m?.isSelf ? '我' : String(m?.sender || m?.userId || '群友');
+        const text = String(m?.plain || m?.text || '').replace(/\s+/g, ' ').slice(0, 140);
+        return `${who}: ${text}`;
+      });
+      const prompt = `【会话切换·上下文桥】你刚刚被切换到 DSH 会话「${record?.name ?? '未命名'}」。
+下面是切换前最近 ${recent.length} 条 QQ 消息，仅作上下文参考，**不要逐条回应，也不要主动发言**：
+${lines.join('\n')}
+
+请安静等待下一条真实消息；这条内容不需要回复。`;
+      await deliverPrompt(key, prompt, { silent: true });
+      log(`[session] ${key} 已注入上下文桥（最近 ${recent.length} 条）`);
+    } catch (error) {
+      log(`[session] 上下文桥注入失败 ${key}: ${error?.message ?? error}`);
+    }
+  }
+  async function handleSessionCommand(key, command) {
+    try {
+      const current = rememberActiveSession(key);
+      const list = catalogFor(state, key);
+      if (command.op === 'list' || command.op === 'current') {
+        saveState();
+        const records = command.op === 'current' ? (current ? [current] : []) : list;
+        const lines = records.map((r) => `${list.indexOf(r) + 1}. ${r.sessionId === state.sessions[key] ? '【当前】' : ''}${r.name}（${r.preset || '未知预设'}）`);
+        await sendToQQ(key, `${lines.join('\n') || '当前聊天尚无已登记的 DSH 会话。'}\n/session new 名称：新建\n/session switch 编号或名称：切换\n/session rename 新名称：重命名当前会话\n仅 owner 可操作；只列出本聊天登记的会话。`);
+        return;
+      }
+      if (sessionSwitches.has(key)) throw new Error('该聊天正在切换会话，请稍后再试');
+      if (command.op === 'rename') {
+        if (!current) throw new Error('当前没有 DSH 会话');
+        rememberSession(state, key, { ...current, name: validateSessionName(command.arg) });
+        saveState();
+        await sendToQQ(key, `当前会话已命名为「${current.name}」`);
+        return;
+      }
+      if (command.op !== 'new' && command.op !== 'switch') throw new Error('用法：/session list | new 名称 | switch 编号或名称 | rename 新名称');
+      const target = command.op === 'switch' ? selectSession(state, key, command.arg) : null;
+      const record = await switchDshSession(key, { target, name: command.op === 'new' ? validateSessionName(command.arg) : null });
+      // 切换后的上下文桥：新会话没有旧会话的 DSH 历史，只靠这一步让它知道刚才聊到哪。
+      await injectSessionContextBridge(key, record);
+      await sendToQQ(key, `已选择「${record.name}」（${record.preset}）。下条消息在此会话继续；其它会话的 DSH 历史保留。`);
+    } catch (error) {
+      log(`[session] 操作失败 ${key}: ${error?.message ?? error}`);
+      await sendToQQ(key, `会话操作失败：${redactSensitiveText(String(error?.message ?? error)).slice(0, 250)}`);
+    }
+  }
+
   async function ensureSession(key) {
     const epoch = sessionEpoch;
+    const version = sessionVersion(key);
     // 会话级 preset 覆盖（/preset 命令写入）优先于按模式推导的默认 preset。
     const desiredPreset = state.presetOverrides?.[key] || modePreset(key, currentMode, cfg);
     // 动态预设（restricted-standard / standard-furina）是安全边界：绝不能因为创建失败而回退到
@@ -7854,6 +8065,9 @@ async function main() {
         disarmTurnLease(existing);
         try { await api.workspace.archiveSession({ sessionId: existing }); } catch {}
       } else {
+        // 历史映射可能缺 preset 记录（早期创建的会话）；补回推导值，
+        // 否则会话池条目会记成 preset=null，之后 /session switch 回不去。
+        if (!state.presets[key]) { state.presets[key] = desiredPreset || null; saveState(); }
         await ensureVisionModel(existing);
         return existing;
       }
@@ -7893,13 +8107,14 @@ async function main() {
         sessionId = value.sessionId;
       }
       // reset/清空工作区期间创建完成：丢弃，防止旧会话复活
-      if (epoch !== sessionEpoch) {
+      if (epoch !== sessionEpoch || version !== sessionVersion(key)) {
         log(`会话创建期间发生 reset，丢弃 ${key} 的新会话（${sessionId}）`);
         try { await api.workspace.archiveSession({ sessionId }); } catch {}
         throw new Error('会话创建期间已重置，丢弃新会话');
       }
       state.sessions[key] = sessionId;
       state.presets[key] = actualPreset;
+      rememberSession(state, key, { sessionId, preset: actualPreset });
       reverse.set(sessionId, key);
       saveState();
       await ensureVisionModel(sessionId);
@@ -8824,6 +9039,8 @@ async function main() {
 
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
   async function deliverPromptNow(key, promptText, opts = {}) {
+    const version = sessionVersion(key);
+    if (sessionSwitches.has(key)) return { ok: false, superseded: true };
     const delivery = ensureDelivery(key, opts);
     opts = { ...opts, deliveryId: delivery.deliveryId };
     if (!dshReady) {
@@ -8834,6 +9051,10 @@ async function main() {
     try {
       sessionId = await ensureSession(key);
     } catch (error) {
+      if (version !== sessionVersion(key)) {
+        rollbackDelivery(delivery.deliveryId, 'session-switch');
+        return { ok: false, superseded: true };
+      }
       if (String(error?.message ?? error).includes('会话创建期间已重置')) {
         enqueueForRetry(key, promptText, opts);
         return { ok: true, retried: true };
@@ -8847,6 +9068,10 @@ async function main() {
       content = [{ type: 'text', text: signedText }, ...imageParts];
     }
     // 提交前只登记 deliveryId；静默/退场/唤醒标记要等 DSH 明确接受后才生效。
+    if (version !== sessionVersion(key) || sessionSwitches.has(key) || state.sessions[key] !== sessionId) {
+      rollbackDelivery(delivery.deliveryId, 'session-switch');
+      return { ok: false, superseded: true };
+    }
     beginDeliverySubmission(delivery, sessionId);
     let accepted;
     try {
@@ -8855,6 +9080,10 @@ async function main() {
     } catch (error) {
       rollbackDelivery(delivery.deliveryId, 'transport-error');
       throw error;
+    }
+    if (version !== sessionVersion(key) || state.sessions[key] !== sessionId) {
+      rollbackDelivery(delivery.deliveryId, 'session-switch');
+      return { ok: false, superseded: true };
     }
     if (!accepted.result.ok) {
       rollbackDelivery(delivery.deliveryId, 'rejected');
@@ -9996,6 +10225,7 @@ async function main() {
   }
 
   async function sendWakePromptV2(key, reason, turnAuth = null, options = {}) {
+    if (sessionSwitches.has(key)) return { ok: false, superseded: true };
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -10352,6 +10582,7 @@ async function main() {
   }
 
   function scheduleWakeV2(key, reason, turnAuth = null) {
+    if (sessionSwitches.has(key)) return;
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -10556,6 +10787,7 @@ async function main() {
   // QQ 消息 → DSH prompt
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
+    const inputVersion = sessionVersion(key);
     bridgeStatus.lastInboundAt = Date.now(); // 收到任意 QQ 消息即刷新（含被拒的未授权会话，用于证明链路真的在收数据）
     if (event?.self_id != null && bridgeStatus.selfId == null) bridgeStatus.selfId = String(event.self_id);
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
@@ -10602,6 +10834,20 @@ async function main() {
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
     // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
     const p = pending.get(key);
+    // Session commands must remain usable while DSH is asking a question.
+    const sessionCommand = parseSessionCommand(plainContent);
+    if (sessionSwitches.has(key) || inputVersion !== sessionVersion(key)) {
+      if (isOwner) await sendToQQ(key, '正在切换 DSH 会话，请稍后重发');
+      return;
+    }
+    if (sessionCommand) {
+      if (!isOwner) {
+        await handleNonOwnerAdminCommand(key, kind, plainContent, '/session');
+        return;
+      }
+      await handleSessionCommand(key, sessionCommand);
+      return;
+    }
     if (p && (p.kind === 'question' || isOwner)) {
       await handlePendingAnswer(p, plainContent, key, isOwner);
       return;
@@ -10664,6 +10910,7 @@ async function main() {
       if (plainContent === '/reset' || plainContent === '/new') {
         const old = state.sessions[key];
         if (old) {
+          rememberActiveSession(key);
           sessionEpoch++;
           delete state.sessions[key];
           delete state.presets[key];
@@ -10777,7 +11024,7 @@ async function main() {
         return;
       }
       if (plainContent === '/dshstart' || plainContent === '/启动dsh' || plainContent === '/dshstatus' || plainContent === '/dsh状态') {
-        // 启动/查看承载本会话的 DSH：用本机的 start-qqbot-webui.ps1（公开仓库不附带），并把结果回显到 QQ
+        // 启动/查看承载本会话的 DSH：用项目自带的 start-qqbot-webui.ps1，并把结果回显到 QQ
         if (!isOwner) { await sendToQQ(key, '只有 owner 能用这个命令。'); return; }
         const startScript = path.join(ROOT, '..', 'start-qqbot-webui.ps1');
         const statusScript = path.join(ROOT, 'scripts', 'restart-dsh.ps1');
@@ -10794,7 +11041,7 @@ async function main() {
         return;
       }
       if (plainContent === '/dshrestart' || plainContent.startsWith('/dshrestart ') || plainContent === '/重启dsh' || plainContent.startsWith('/重启dsh ')) {
-        // 重启 DSH：延迟 N 秒让 turn 收尾，然后交给本机 dsh-restart.ps1（公开仓库不附带；内部再调 restart-qqbot-webui.ps1）。
+        // 重启 DSH：延迟 N 秒让 turn 收尾，然后交给 dsh-restart.ps1（内部再调官方 restart-qqbot-webui.ps1）。
         // 用 -File 调包装脚本，而不是 -Command 内联引号——shell:true 会对内联命令二次解析，容易静默失败。
         if (!isOwner) { await sendToQQ(key, '只有 owner 能用这个命令。'); return; }
         const wrapper = path.join(ROOT, 'scripts', 'dsh-restart.ps1');
@@ -11007,6 +11254,7 @@ async function main() {
           return;
         }
         if (!state.presetOverrides) state.presetOverrides = {};
+        rememberActiveSession(key);
         state.presetOverrides[key] = argRaw;
         saveState();
         // 立刻丢掉旧会话映射：下一条消息用新 preset 重建（旧 DSH 会话留在这边不动）。

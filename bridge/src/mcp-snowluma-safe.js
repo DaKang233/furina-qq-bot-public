@@ -701,14 +701,16 @@ if (cfg.socialV2?.tools?.sendMarkdown !== false) {
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       markdown: z.string().optional().describe('Markdown 正文（与 path 二选一）'),
       path: z.string().optional().describe('本地 .md 文件绝对路径（与 markdown 二选一）'),
+      theme: z.enum(['card', 'book', 'plain']).optional().describe('可选：版式。card=白卡片（默认，信息卡观感）；book=米色纸张+衬线字；plain=纯白整页'),
       width: z.number().optional().describe('可选：页面宽度 CSS px，默认 1080'),
       height: z.number().optional().describe('可选：页面高度 CSS px；不传按内容估算')
     },
-    async ({ key, token, markdown, path: mdPath, width, height }) => {
+    async ({ key, token, markdown, path: mdPath, width, height, theme }) => {
       try {
         const body = { key };
         if (markdown) body.markdown = markdown;
         if (mdPath) body.path = mdPath;
+        if (theme) body.theme = theme;
         if (width) body.width = width;
         if (height) body.height = height;
         const data = await agentApi('/api/socialV2/md-image', {

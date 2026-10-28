@@ -77,6 +77,7 @@ export class NodeApiClient {
     this.sessions = {
       create: (request = {}) => this.createSession(request),
       prompt: (request) => this.promptSession(request),
+      cancel: (request) => this.rpcRequest('session/cancel', request),
       selectModel: (request) => this.rpcRequest('session/selectModel', request),
     };
     this.workspace = {
@@ -84,6 +85,7 @@ export class NodeApiClient {
       rename: (request) => this.rpcRequest('workspace/rename', request),
       delete: (request) => this.rpcRequest('workspace/delete', request),
       archiveSession: (request) => this.rpcRequest('workspace/archiveSession', request),
+      unarchiveSession: (request) => this.rpcRequest('workspace/unarchiveSession', request),
       list: () => this.workspaceList(),
     };
     this.events = { mux: (_payload, signal, onOpen) => this.readEvents(signal, onOpen) };

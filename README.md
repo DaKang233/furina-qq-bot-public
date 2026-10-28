@@ -101,6 +101,7 @@ preset 源在 `bridge/dsh/agent-presets/`。当前 DSH 版本从 profile bundle 
 | [`console/`](console/)、[`mobile-controller/`](mobile-controller/)、[`desktop-controller/`](desktop-controller/)、[`server/`](server/)、[`deploy/`](deploy/) | 旧路线的安卓/Windows 控制台、服务端看护与部署清单 | 配套旧路线，非 bridge 所需 |
 | [`node-studio/`](node-studio/) | 行为节点的可视化离线原型（与机器人完全隔离） | 独立实验项目 |
 | [`docs/`](docs/) | 54 份技术文档：部署手册、根因分析、实测记录 | 旧路线实测记录，仍有参考价值 |
+| `start-qqbot-webui.ps1` 等 | 本机启停/重启 DSH 的便捷脚本 | 路径按本机写死，换机器需改 `$DshCli` / `$Node` |
 
 ### 快速开始（Windows 单机）
 
@@ -124,7 +125,9 @@ copy config.example.json config.json
 # 3. 安装 DSH 端（preset + MCP server + qq-mode 控制台插件，并写入默认模式 reserved2）
 node scripts/setup-dsh.mjs
 
-# 4. 启动 DSH Web（公开仓库不附带启停脚本；用你自己的方式启动 qqbot 预设，监听 3081）
+# 4. 启动 DSH Web（本机脚本；换机器请用你自己的 DSH 启动方式）
+..\start-qqbot-webui.ps1 -OpenBrowser      # 固定 qqbot 预设 + 3081 端口
+# ..\stop-qqbot-webui.ps1                  # 需要关闭时
 
 # 5. 启动桥接（在可见窗口里跑；崩溃后由 restart.bat 一键重启）
 npm start
@@ -152,7 +155,7 @@ npm start
 npm run self-test
 ```
 
-> 公开仓库**不附带**本机的 DSH 启停脚本（`start/stop/restart-qqbot-webui.ps1` 等已移除，避免把本机路径和内网信息带进公开代码）。桥接的 `/dshstart`、`/dshstatus`、`/dshrestart` 依赖这些脚本：缺脚本时会直接回复「找不到脚本」，需要这些能力请用你自己的启停方式，或在本机补回同名脚本。
+> 根目录的 `start-qqbot-webui.ps1` / `stop-qqbot-webui.ps1` / `restart-qqbot-webui.ps1` 是**本机专用**脚本（里面写死了 DSH 与 Node 的绝对路径，并会校验 3081 端口上的进程身份），换机器请改脚本变量或用自己的启动方式。`restart-qqbot-webui.ps1` 只重启 DSH——桥接会自己重连，不需要跟着重启。
 
 ### 机器人能做什么
 
@@ -245,7 +248,7 @@ node scripts/verify-install.mjs   # 安装完整性检查
 ### 隐私与合规
 
 - 运行配置与状态全部在 `.gitignore` 里（`config.json`、`bridge/state/`、`SnowLuma/`、`logs/`、`backups/`、`browser-profile/`）——里面有 accessToken、QQ 号、聊天原文与本机路径，**绝不入库**。
-- 本项目（DaKang233）提交的源码与历史已脱敏：本机路径、内网 IP/SSH 指纹、owner QQ 号、本机专用启停脚本都已替换或移除。**上游（nanbengxian-cyber）的旧路线历史保持原样**——其中的旧文档与测试可能仍包含真实 QQ 号/群名片，不属于本次清理范围。
+- 公开文档里的服务器地址与群号大多用占位符（`your-server.example.com`、`100000001`），但**历史遗留内容尚未完全脱敏**：旧路线文档/测试里仍残留少量真实 QQ 号与群名片，`bridge/` 新代码里也有本机路径、内网 IP、SSH 指纹等信息。**把仓库转为公开前，需要再做一轮脱敏清理。**
 - SnowLuma 是独立第三方项目，与腾讯/QQ 无隶属关系；使用前请阅读其 EULA 与《QQ 用户协议》，仅用于学习与技术研究。
 
 ### 许可
@@ -301,7 +304,7 @@ cd bridge
 npm install                            # postinstall patches the @snowluma/sdk ESM issue
 copy config.example.json config.json   # fill DSH / SnowLuma / ownerQQ / allowlists
 node scripts/setup-dsh.mjs             # install presets + MCP servers + qq-mode plugin
-# start DSH Web yourself (machine-specific helper scripts are not shipped in this repo)
+..\start-qqbot-webui.ps1 -OpenBrowser  # start DSH Web (this machine's convenience script)
 npm start                              # run in a visible console window
 ```
 

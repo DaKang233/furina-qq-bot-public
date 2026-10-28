@@ -16,6 +16,7 @@
     "test-forward": "node scripts/test-forward.mjs",
     "test-error-routing": "node scripts/test-error-routing.mjs",
     "test-routing": "node scripts/test-preset-routing.mjs",
+    "test-session-switch": "node --test scripts/test-session-switch.mjs",
     "test-turn-auth": "node scripts/test-turn-auth.mjs",
     "test-turn-auth-guard": "node scripts/test-turn-auth-guard.mjs",
     "test-slang": "node scripts/test-slang-learn.mjs",
