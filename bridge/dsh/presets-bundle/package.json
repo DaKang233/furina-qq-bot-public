@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-qq-presets",
+  "version": "1.1.0",
+  "description": "QQ 聊天预设（qq-chat / qq-chat-v2 / restricted-standard）bundle",
+  "private": true,
+  "type": "module",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

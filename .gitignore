@@ -1,0 +1,98 @@
+# 忽略构建产物与本地状态
+node_modules/
+__pycache__/
+*.pyc
+build/
+out/
+state/
+
+# 密钥与本机配置：绝不入库
+*.jks
+*.keystore
+.env
+config.json
+*.credentials.yaml
+*.idsig
+
+# Windows desktop-controller local packaging artifacts
+/desktop-controller/build/
+/desktop-controller/dist/
+/desktop-controller/.venv-build/
+/desktop-controller/__pycache__/
+/desktop-controller/tests/__pycache__/
+/desktop-controller/*.spec
+/desktop-controller/controller-profile.json
+/desktop-controller/server-profile.json
+
+# 机器人真实运行配置：只留在服务器上，绝不入库
+/deploy/robot.env
+/deploy/*.tmp
+
+# 部署暂存与生产快照：属于本机工作产物，不是源码
+# .deploy-poke-v2/ 是往生产推插件前的暂存副本，prod-ref/ 是生产的只读快照，
+# 两者都会被 plugins/ 下的正式版本取代（内容常有重名但版本更旧），入库只会造成混淆。
+/.deploy-poke-v2/
+/prod-ref/
+
+# 生产环境日志与数据库：可能含群聊原文与 QQ 号，绝不入库
+*.log
+*.db
+*.db.bak*
+*.sqlite
+*.sqlite3
+
+# 目录扫描测试留下的临时目录（如 dsh-poke 的 .test_poke.py.<pid>.<uuid>.tmpdir）
+.*.tmpdir/
+
+# 编辑器与系统
+.DS_Store
+*.swp
+*.bak
+*.bak.*
+
+# 本机安装的 SnowLuma QQ 客户端：自带 node.exe 与 index.mjs，
+# config/ 里有 accessToken，data/ 与 logs/ 有群聊原文 —— 绝不入库。
+/SnowLuma/
+/SnowLuma-*.zip
+
+# 本机浏览器快照目录（start-qqbot-webui.ps1 -OpenBrowser 使用的 Edge InPrivate profile，
+# 约 9700 个文件 / 2.4 GB，属于纯机器状态）
+/browser-profile/
+
+# 本机部署与配置回滚快照（backups/<主题>-<时间戳>/，只服务这台机器）
+/backups/
+
+# 本机专属启动辅助脚本（硬编码本机盘符与路径，如 DSH 启动、TTS API 开机自启）
+/tools/
+
+# 根目录运行日志（DSH qqbot profile 的 stdout / stderr 及带时间戳的归档）
+/logs/
+
+# restart-qqbot-webui.ps1 的运行时锁文件
+/.restart-qqbot-webui.lock
+
+# 本机专用 DSH 启停/重启与审计辅助脚本：硬编码本机盘符、安装路径、会话 key，
+# 公开仓库不附带（需要时由使用者在本机自行放回，不改文件名即可继续用）。
+/start-qqbot-webui.ps1
+/stop-qqbot-webui.ps1
+/restart-qqbot-webui.ps1
+/bridge/scripts/dsh-restart.ps1
+/bridge/scripts/dsh-stopstart.cmd
+/bridge/scripts/restart-dsh.ps1
+/bridge/scripts/restart-self-dsh.cmd
+/bridge/scripts/restart-self-dsh.mjs
+/bridge/scripts/relay-3081.mjs
+/bridge/scripts/relay-task.mjs
+# 本机内网 SSH 执行 MCP：含内网地址与主机指纹，公开仓库不附带
+/bridge/src/mcp-remote-ssh.js
+
+# 带时间戳的备份文件（*.bak / *.bak.* 已覆盖；这里补 *.bak-YYYYMMDD 形式）
+*.bak-*
+
+# presets-bundle 的生成产物：由同目录 build.mjs 从 ../agent-presets 生成，
+# build.mjs 与 package.json 才是源码
+/bridge/dsh/presets-bundle/cordis.patch.yml
+/bridge/dsh/presets-bundle/qq-tool-restrict.mjs
+# 测试临时文件（.test_* 目录与 .tmp）
+.test_*.tmpdir/
+*.tmp

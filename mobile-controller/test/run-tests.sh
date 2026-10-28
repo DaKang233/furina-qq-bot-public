@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# 纯 JVM 单测 —— 不需要模拟器、不需要真机、不需要 adb（与 console/ 同一思路）。
+#
+# 能这么跑的前提是：所有会出错的逻辑都在**不碰 android.* 的类**里
+# （Json / NapCatClient / Deployer / DeployConfig / Knobs / Totp）。
+# Activity 与 View 类里只有画界面和点事件，那部分本来也不是单测能覆盖的东西。
+#
+# 用法：bash test/run-tests.sh
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+OUT=test/out
+SRC=app/src/com/dafeiyu/controller
+
+# 只编不依赖 Android 的那几个类。故意不写 *.java：
+# 一旦有人把 android.* 的 import 加进这些文件，这里会立刻编译失败 ——
+# 这正是我们要的信号（可测的核心被污染了），而不是悄悄失去可测性。
+PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
+$SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
+$SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
+$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java $SRC/QrLayout.java \
+$SRC/Protocols.java $SRC/AppUpdate.java"
+
+for f in $PURE; do
+  [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
+done
+
+# 反向检查：这几个文件里不许出现 android 的 import。
+if grep -l '^import android\.' $PURE 2>/dev/null | grep -q .; then
+  echo "以下文件混进了 android.* import，会失去可测性：" >&2
+  grep -l '^import android\.' $PURE >&2
+  exit 1
+fi
+
+# 反向检查（血的教训）：UI 类里的控件字段，凡是「声明了但从未赋值」又「被 .方法() 调用」的，
+# 就是启动即崩的 NPE —— v1.0.0 的 testBtn/deployBtn 漏了创建，App 一打开就闪退。
+# 这类 bug 编译期不报、单测也碰不到（View 类不进测试面），只能靠静态扫。
+if ! python3 test/check-unassigned-fields.py; then
+  echo "控件字段未赋值检查未通过：上面的字段会以 null 被调用，App 启动就会崩。" >&2
+  exit 1
+fi
+
+# 反向检查（血的教训之二）：逻辑单测全绿，但生产代码**根本没调用**它。
+# 「修 APK 不显示二维码」时就是这么被骗过去的：WebProxyPath 测得好好的，
+# 实际四个接口没剥 data 外壳。这次的同类风险是网页自动登录的三处接线，
+# View/Activity 不进单测面，只能静态扫。
+if ! python3 test/check-weblogin-wiring.py; then
+  echo "网页自动登录接线检查未通过：逻辑对了但没接上，用户看到的现象和没修一样。" >&2
+  exit 1
+fi
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+# Tunnel.java 用到 JSch（端口转发），测试面里要带上这个 jar
+JSCH=lib/jsch-0.2.17.jar
+[ -f "$JSCH" ] || { echo "缺 $JSCH" >&2; exit 1; }
+
+ZXING=lib/zxing-core.jar:lib/zxing-jse.jar
+[ -f lib/zxing-core.jar ] || { echo "缺 lib/zxing-core.jar（测试用独立二维码解码器）" >&2; exit 1; }
+
+javac -encoding UTF-8 -nowarn -d "$OUT" -cp "app/src:$JSCH:$ZXING" \
+  $PURE test/tests/*.java
+
+java -cp "$OUT:$JSCH:$ZXING" tests.Main
+
+# 注入脚本要用**真 JS 引擎**跑一遍 —— 单测只能验证脚本字符串长什么样，
+# 证明不了它真的能工作。这段脚本坏了的表现是「页面能打开但一登录就失败」，
+# 看起来一切正常，所以必须实测。
+bash test/run-shim-test.sh
+
+# 网页自动登录也要用真 JS 引擎跑一遍 —— 单测只能证明地址拼得对，
+# 证明不了 NapCat 的登录页**真的会**因为它而自动登录。
+# 两者症状一样（用户对着「请输入token」发愣），所以必须分开验证。
+bash test/run-weblogin-test.sh
+
+# 反向检查（第三次踩同一个坑的风险）：服务器加了接口、App 加了按钮，
+# 但按钮没接到接口 / 自检结果没显示出来 —— 用户看到的和没修一样。
+if ! python3 test/check-channel-wiring.py; then
+  echo "消息通道接线检查未通过：按钮或提示是死的，用户依然会觉得「没修」。" >&2
+  exit 1
+fi
+
+# 消息通道配对（「机器人一个字都不回」的根因修复）：
+# 光有配置逻辑不够，必须证明「两端 token 一致才算配对成功」——
+# 这条判据错了的话，用户看到的是「保存成功但依然不回话」。
+if ! python3 test/test-pairing.py; then
+  echo "消息通道配对检查未通过：机器人会收不到消息（表现是一个字都不回）。" >&2
+  exit 1
+fi
+
+# 向后兼容：已经在跑的实例升级后必须**一点变化都没有**。
+# 这次改动会重写 AstrBot 的 provider 配置；对「没填协议」的老实例
+# 如果写错了什么，线上正在用的机器人会**同时**不回话，
+# 而用户的第一反应是「你把我的机器人搞坏了」。
+if ! python3 test/test-backward-compat.py; then
+  echo "向后兼容检查未通过：老实例升级后行为可能变了。" >&2
+  exit 1
+fi
+
+# 源码树里的 Preset.java 必须是空模板。
+# 这条是纯粹的**安全**检查：真实凭据泄漏不会让 App 出任何问题
+# （内置版反而更「能用」），所以功能测试全是绿的，只有专门盯它才发现得了。
+# 2026-09-18 我自己踩过：脚本里多写了一个 EXIT trap 覆盖掉还原逻辑，
+# 服务器地址、SSH 私钥、管理口令全留在了这个被 git 跟踪的文件里。
+if ! python3 test/check-preset-clean.py; then
+  echo "Preset.java 里有真实凭据残留，**不要 commit**。" >&2
+  exit 1
+fi
+
+# 接口地址的规范化：用户填的各种形状都必须拼出**能用的** URL。
+# 用户是从别家配置复制地址过来的，`/v1` 常常留着；
+# 而各家适配器对 api_base 的处理不同，多一个 /v1 就会拼出 /v1/v1/... 的 404，
+# 报错却指向「地址写错了」—— 用户会去反复改地址，永远改不好。
+if ! python3 test/test-api-base-shapes.py; then
+  echo "地址规范化检查未通过：某些填法会拼出 404 的 URL。" >&2
+  exit 1
+fi
+
+# 「机器人运行中停止不了」的修复接线。
+# 这条 bug 的特征是「逻辑单测全绿、界面就是不给按钮」——
+# View 类不进单测面，只能静态扫。退回原状的话用户依然停不掉机器人。
+if ! python3 test/check-stop-button-wiring.py; then
+  echo "停止按钮接线检查未通过：半死状态下用户又会没有「停止」可用。" >&2
+  exit 1
+fi
+
+# 协议表里的每一项都必须**真实存在**于 AstrBot。
+# 这条抓到过一个真 bug：表里混进了 "mirarouter_chat_completion"，
+# 而生产 AstrBot 里根本没有这个适配器（全库 grep 零命中）。
+# 后果是「选了就坏」：AstrBot 加载失败，App 却显示「保存成功」，
+# 机器人再也不回话 —— 用户会一直去改 API Key，永远查不到病根。
+if ! python3 test/check-protocol-adapters.py; then
+  echo "协议适配器检查未通过：给了用户一个「选了就坏」的选项。" >&2
+  exit 1
+fi
+
+# provider 名必须和 AstrBot 官方模板一致。
+# 这个字段不参与适配器查找，所以写错**不会报错** ——
+# 它只决定厂商专属的请求改写是否生效（静默少一层兼容修正）。
+if ! python3 test/check-protocol-providers.py; then
+  echo "provider 名与官方模板不一致（不会报错，但会静默少一层厂商修正）。" >&2
+  exit 1
+fi
+
+# 接口协议与自定义请求体的接线。
+# 这一项防的是「服务器加了参数、App 没提交」这类断线 ——
+# 用户看到「保存成功」，实际协议没变、参数没生效，而且界面上
+# 完全看不出区别。还顺带核对 App 与服务器两份协议表必须一致
+# （不一致时用户会选到服务器不认的协议，或根本选不到某个协议）。
+if ! python3 test/check-protocol-wiring.py; then
+  echo "协议接线检查未通过：用户选了协议/填了参数，但根本没生效。" >&2
+  exit 1
+fi
+
+# 识图 API 的接线。逻辑单测全绿但生产代码没调用，是这个项目踩过的真坑
+# （「修 APK 不显示二维码」时，四个接口没剥 data 外壳，单测照样全过）。
+# 这条检查刚写出来就抓到一个真 bug：保存时根本没把 vision_* 提交上去。
+if ! python3 test/check-vision-wiring.py; then
+  echo "识图接线检查未通过：防呆做了但没接上，用户看到的和没做一样。" >&2
+  exit 1
+fi
+
+# 虚拟屏（验证码/二维码/密码）的接线。View/Activity 不进单测面，
+# 「逻辑对了但没接上」只能静态扫 —— 验证码屏这类用后即弃的界面
+# 接错了的症状跟没做一样（还是得去主界面翻验证码，还可能泄露密码框）。
+# 已修复的误报：外层 FrameLayout 允许 `android.widget.FrameLayout` 全限定写法。
+if ! python3 test/check-virtual-screen-wiring.py; then
+  echo "虚拟屏接线检查未通过：验证码/密码悬浮屏没接上，或退出时没清理干净。" >&2
+  exit 1
+fi
+
+# 「Key 留空=不改」是否真的成立。
+# App 的 Key 框一直这么写（因为 Key 不回显），但服务器原来要求三样填全，
+# 于是用户**只改人格或只改模型名都做不到**，必须回官网重新复制 Key。
+if ! python3 test/test-blank-key.py; then
+  echo "「Key 留空=不改」检查未通过：用户会改不动配置。" >&2
+  exit 1
+fi
+
+# 换 Key 后重启把配置覆盖回旧值（AstrBot 启动时用内存配置重写 cmd_config.json）。
+# provider 条目会被保住、但 Key/地址/模型名可能被旧内存值盖回去 ——
+# 表现正是「换了新 Key 却怎么都改不动」：保存提示成功，机器人还用旧 Key。
+# 这条证明 apply_config 能自愈，救不回时必须明确报错、绝不静默成功。
+if ! python3 test/test-key-restart-drift.py; then
+  echo "换 Key 重启覆盖竞态检查未通过：用户会「怎么都改不动 Key」。" >&2
+  exit 1
+fi
+
+# 长期运行的容器：启动标记会被后续日志挤出 tail 80（线上 dfy 实例
+# 就是「Up 24h、日志 10555 行、标记在第 509 行」，于是一次写入配置
+# 都报「聊天服务还没启动完」）。就绪判据必须兜住「容器在跑」这一档。
+if ! python3 test/test-astrbot-ready.py; then
+  echo "AstrBot 就绪判据检查未通过：长期运行实例会被误判「没启动完」。"
+  exit 1
+fi
+
+# 识图 API 的**能力**探测。「能连上」不等于「能看图」——
+# 很多网关会接受带图片的请求然后完全忽略图片、瞎猜一个答案。
+# 这组测试用假服务器模拟「假装能看」的模型，证明探测不会被骗过去。
+if ! python3 test/test-vision-probe.py; then
+  echo "识图能力探测检查未通过：会把「假装能看图」的模型判成好的。" >&2
+  exit 1
+fi
+
+# 识图 API 的写入。重点是「不填就不动」「只填一半要报错」
+# 「不能抢主聊天的位置」——这几条错了，用户会配出一个看起来成功、
+# 实际文字也走视觉模型（又慢又贵）或图片根本识别不了的机器人。
+if ! python3 test/test-vision-write.py; then
+  echo "识图 API 写入检查未通过。" >&2
+  exit 1
+fi
+
+# 锁着的实例：必须给 pairing（否则私密机器人坏了修不了），
+# 但绝不能借这个字段泄露 token / API key / 白名单。
+if ! python3 test/test-locked-pairing.py; then
+  echo "私密实例的 pairing 检查未通过：要么修不了，要么泄露了秘密。" >&2
+  exit 1
+fi
+
+# 额度与闲置清理。★ 重点是「宁可留着也不误删」的那几条：
+# 读不到活动时间必须跳过，锁着的实例必须跳过。
+if ! python3 test/test-quota.py; then
+  echo "额度/闲置清理检查未通过：可能误删用户的机器人，或额度没生效。" >&2
+  exit 1
+fi
+
+# 时区无关性。踩过的真坑：用 time.mktime 解析 UTC 时间戳，
+# 本地(UTC)测试全过，一上服务器(UTC+8)就偏 8 小时。
+# 这里显式在三个时区各跑一遍，任何时区不一致都会失败。
+for tz in UTC Asia/Shanghai America/New_York; do
+  if ! TZ=$tz python3 test/test-tz.py; then
+    echo "时区无关性检查未通过（TZ=$tz）：闲置时间会算错，可能导致误删或漏删。" >&2
+    exit 1
+  fi
+done
+
+# 公告 / 检查更新的服务器端（app-update.json 解析、/app/apk 字节流导出）。
+# 服务器少个字段必须返回空壳而不是 500 —— App 靠它决定弹不弹窗，
+# 服务端坏了 App 不该跟着坏。
+if ! python3 test/test-app-update.py; then
+  echo "公告/更新接口（服务端）检查未通过：/app/update 或 /app/apk 有 bug。"
+  exit 1
+fi
+
+# 公告 / 检查更新的 App 端**接线**。逻辑（AppUpdateTest 解析/判定/sha256）
+# 测对了不代表接上了：「连接成功 → 弹窗 → 下载 → 校验 → 安装」整条链
+# 都在 View/Activity/manifest 层，单测照不到，只能静态扫 ——
+# 少接一环用户看到的现象就是「点了没反应 / 装了没校验 / 没有这个功能」。
+if ! python3 test/check-app-update-wiring.py; then
+  echo "公告/更新接线（App 端）检查未通过：功能没接上，用户看到的和没做一样。"
+  exit 1
+fi
+
+# 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
+if [ -f build/dafeiyu-controller.apk ]; then
+  bash test/check-desensitize.sh || exit 1
+fi
