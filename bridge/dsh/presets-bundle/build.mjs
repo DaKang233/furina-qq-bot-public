@@ -39,9 +39,10 @@ const qc = readPreset('qq-chat')
 const v2 = readPreset('qq-chat-v2')
 const restricted = readPreset('restricted-standard')
 const furina = readPreset('standard-furina')
+const furinaCordis = readPreset('furina-cordis')
 
 const header = [
-  '# QQ chat agent presets bundle: qq-chat, qq-chat-v2, restricted-standard and standard-furina.',
+  '# QQ chat agent presets bundle: qq-chat, qq-chat-v2, restricted-standard, standard-furina and furina-cordis.',
   '# Migrated from the legacy $DSH_HOME/.agent-presets/<id>/ layout, which this',
   '# DSH version no longer reads. Installed as a workspace bundle into the',
   '# qqbot profile; plugin list is verbatim from each agent.cordis.yml.',
@@ -55,6 +56,6 @@ const guard = [
   ''
 ].join('\n')
 
-fs.writeFileSync(`${out}/cordis.patch.yml`, header + block(qc, 'qq-chat', 'preset-qq-chat') + block(v2, 'qq-chat-v2', 'preset-qq-chat-v2') + block(restricted, 'restricted-standard', 'preset-restricted-standard') + block(furina, 'standard-furina', 'preset-standard-furina') + guard)
+fs.writeFileSync(`${out}/cordis.patch.yml`, header + block(qc, 'qq-chat', 'preset-qq-chat') + block(v2, 'qq-chat-v2', 'preset-qq-chat-v2') + block(restricted, 'restricted-standard', 'preset-restricted-standard') + block(furina, 'standard-furina', 'preset-standard-furina') + block(furinaCordis, 'furina-cordis', 'preset-furina-cordis') + guard)
 fs.copyFileSync(`${base}/restricted-standard/qq-tool-restrict.mjs`, `${out}/qq-tool-restrict.mjs`)
 console.log('written', fs.statSync(`${out}/cordis.patch.yml`).size, 'bytes')

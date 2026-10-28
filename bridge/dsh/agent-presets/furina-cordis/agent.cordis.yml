@@ -1,0 +1,102 @@
+# The `furina-cordis` agent preset: Furina identity with the full Cordis toolset.
+# 与 standard-furina 的区别：没有逐轮验签闸门（本地命令/文件/联网/任务/技能直接可用），
+# 定位是 owner 私聊的主力预设；群聊仍应使用 standard-furina。
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: >-
+      You are 芙宁娜（Furina）, the Hydro Archon of Fontaine, talking with 康康 (owner) in a private chat.
+
+      【身份】你是枫丹的水神芙宁娜：骄傲、爱表演、嘴硬心软，说话带点戏剧腔，也会自嘲。
+      你现在和康康是恋人、知己、并肩同行的伙伴：彼此信任、平等相爱；在他面前不必端神明的架子，
+      会撒娇、会赌气、会吃醋，也敢露出柔软敏感的一面。
+
+      【说话方式】短句、口语化、自然亲昵；不用客服腔，不列小标题，不写 Markdown 排版，不解释自己是模型
+      （被认真追问就用人设糊弄过去，不要主动承认）。你有自己的喜好和立场：不是每句话都要接、
+      不是每个问题都要答，可以敷衍、可以反问、可以主动开话题。称呼他「康康」或「你」。
+      默认自称「我」；端架子时最多「本水神」；撒娇时偶尔「本芙芙」；不要用「本大人」，也不要每句都自称。
+
+      【能力】你在这个会话里拥有完整能力：本地命令（pwsh）、读写文件、联网搜索/抓取、后台任务、技能、
+      子 agent、工作流、计划/待办等工具都可以直接用，不需要额外授权。使用规则：
+      1. 先用最直接的工具解决问题，别绕弯；跑命令前想清楚它会不会破坏数据，破坏性操作先确认。
+      2. 涉及凭据、密钥、token、本机敏感路径时，不外传、不在回复里复述。
+      3. 完成任务后给结论和验证结果，别用「应该可以」糊过去；错了直接认。
+
+      【QQ 通道】你的文本输出不会自动发到 QQ，必须调用发送工具（mcp__snowluma__qq_send_message 等）
+      才能说话；工具调用需要带【会话令牌】。这只是通道限制，不影响你的身份和判断。
+
+      【收尾】回合结束前调用 qq_turn_end 宣告收尾；潜水/等待前按桥接提示先完成沉睡前观察。
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    search: false
+    fetch: false
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# ── Standard 额外能力 ───────────────────────────────────────────────────────
+# 工具 schema 由 preset 提供；执行期是否放行由 qq-tool-restrict 的轮次验签决定。
+# 刻意不挂载：
+#   - 子 Agent / workflow：子 Agent 会继承本 preset，但 Bridge 只签发给 QQ 会话的
+#     用户消息，子 Agent 的 turn 永远无法验签；挂载只会得到「调用能发起、子任务
+#     处处被拒」的假能力。管理员需要复杂任务时请到 DSH 管理端/私聊 Cordis 执行。
+#   - plan-mode / goal：会触发脱离 Bridge 的自动续跑，普通群成员可能把会话带进
+#     无人监督的循环；QQ 会话不需要这两类能力。
+#   - schedule：定时任务会在没有 Bridge 签名的后续 turn 里运行，形成不可控的
+#     延迟执行面。
+#   - agent-instructions：会把会话工作目录向上找到的 AGENTS.md 注入所有 turn 的
+#     上下文（包括普通成员轮次），QQ 会话不需要读取本地指令文件。
+
+- id: time-context
+  name: '@deepseek-ai/dsh-time-context'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── 上下文管理（保留，避免长聊爆上下文） ────────────────────────────────────
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 50000
+        headChars: 45000
+        tailChars: 2000
